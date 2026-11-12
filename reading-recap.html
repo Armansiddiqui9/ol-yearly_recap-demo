@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reading Recap · Open Library</title>
+<!--
+READING RECAP: a removable, 3-card share component for Open Library (prototype)
+Card 1 = your progress, Card 2 = top authors (Open Library author photos), Card 3 = books + genres.
+
+ASSUMPTIONS
+- Data mirrors OL fields: log {key, shelf, date}, ratings {key, rating, date},
+  works {key, title, authors[], author_key?, cover_id? | cover_isbn?, first_publish_year, pages?, subjects?}, goal.
+- Host integration: set window.OL_RECAP_DATA = {viewer, owner, log, ratings, works, goal}. If owner !== viewer
+  nothing renders (private logs). A Goodreads/StoryGraph CSV can be imported instead (parsed locally, never stored).
+- Only Open Library is contacted: openlibrary.org/search.json (author keys, subjects, cover ids, page counts)
+  and covers.openlibrary.org (book covers + author photos). Nothing else, nothing stored, no tracking.
+- GENRES are a best guess: OL subjects are free-text, so a small keyword table maps them to broad genres.
+  The first matching rule wins, and books with no usable subjects simply show no genre chip.
+- "Books read" = Already Read entries whose log date is in the chosen year.
+- Everything is drawn on canvas (1080 wide) so exported PNGs match the preview. Missing covers/photos
+  become neutral placeholders (never tinted). If a canvas ever taints, export retries without remote images.
+- FLAG: window.OL_FEATURES = {readingRecap:false} skips mounting. Delete this file to remove it.
+-->
+<style>
+:root{--bg:hsl(48,31%,84%);--ink:hsl(41,14%,21%);--mut:hsl(41,12%,36%);--panel:#fff;--line:hsl(45,22%,77%);--ctl:hsl(48,38%,97%);--ctl-h:hsl(48,32%,94%);
+--btn:hsl(210,82%,40%);--btn-h:hsl(210,84%,31%);--btnink:#fff;--sel:hsl(218,65%,95%);--sel-ink:hsl(210,84%,31%);color-scheme:light}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom))}
+h1{font:700 1.5rem Georgia,"Times New Roman",serif;margin:.2em 0}
+p.lead{margin:0 0 14px;color:var(--mut)}
+.wrap{max-width:1000px;margin:0 auto;display:grid;gap:18px;grid-template-columns:minmax(0,1fr)}
+@media(min-width:820px){.wrap{grid-template-columns:300px minmax(0,1fr)}header{grid-column:1/-1}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;display:grid;gap:12px;align-content:start}
+fieldset{border:0;margin:0;padding:0}legend,label.l{font-size:.8rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);display:block;margin-bottom:6px}
+.row{display:flex;flex-wrap:wrap;gap:8px}
+button,.file,select,input[type=number]{font:inherit;border-radius:10px;border:1px solid var(--line);background:var(--ctl);color:var(--ink);padding:9px 12px;min-height:44px;cursor:pointer;max-width:100%}
+button:hover,.file:hover{background:var(--ctl-h)}
+select,input[type=number]{width:100%;background:#fff}
+button[aria-pressed=true]{background:var(--sel);color:var(--sel-ink);border-color:var(--btn);font-weight:700}
+button.pri{background:var(--btn);color:var(--btnink);border-color:var(--btn);font-weight:700}
+button.pri:hover{background:var(--btn-h)}
+:focus-visible{outline:3px solid var(--btn);outline-offset:2px}
+input[type=file]{position:absolute;opacity:0;width:1px;height:1px}
+.file:focus-within{outline:3px solid var(--btn);outline-offset:2px}
+.stage{display:grid;gap:12px;justify-items:center;align-content:start}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+canvas{max-width:100%;max-height:74vh;width:auto;height:auto;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+#status{min-height:1.4em;color:var(--mut);font-size:.9rem}
+</style>
+</head>
+<body>
+<main class="wrap" id="reading-recap">
+  <header><h1>Your Reading Recap</h1><p class="lead">Three cards for your year. Built in your browser; nothing is saved or sent anywhere except Open Library lookups.</p></header>
+
+  <section class="panel" aria-label="Card settings">
+    <fieldset><legend>Format</legend>
+      <div class="row" id="fmts" role="group" aria-label="Card format">
+        <button data-f="story" aria-pressed="true">Story 9:16</button>
+        <button data-f="feed" aria-pressed="false">Feed 4:5</button>
+        <button data-f="square" aria-pressed="false">Square 1:1</button>
+      </div></fieldset>
+    <div><label class="l" for="theme">Theme</label><select id="theme"></select></div>
+    <div><label class="l" for="yr">Year</label><select id="yr"></select></div>
+    <div><label class="l" for="goal">Yearly goal (books)</label><input id="goal" type="number" min="0" max="999" inputmode="numeric" placeholder="none"></div>
+    <div class="row">
+      <button id="surprise" type="button">🎲 Surprise me</button>
+      <label class="file">Import CSV<input id="csv" type="file" accept=".csv,text/csv"></label>
+    </div>
+    <div class="row">
+      <button class="pri" id="share" type="button">Share all 3</button>
+      <button id="dl" type="button">Download this card</button>
+      <button id="dlall" type="button">Download all 3</button>
+      <button id="copy" type="button">Copy link</button>
+    </div>
+    <div id="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <section class="stage">
+    <div class="tabs" id="tabs" role="group" aria-label="Choose card">
+      <button data-c="0" aria-pressed="true">1 · Progress</button>
+      <button data-c="1" aria-pressed="false">2 · Authors</button>
+      <button data-c="2" aria-pressed="false">3 · Genres</button>
+    </div>
+    <canvas id="cv" role="img" aria-label="Reading recap card"></canvas><p class="sr" id="alt"></p>
+  </section>
+</main>
+
+<script>
+(() => {
+if (window.OL_FEATURES && window.OL_FEATURES.readingRecap === false) return; // feature flag
+
+if (!CanvasRenderingContext2D.prototype.roundRect) CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {   // older Safari/Firefox
+  r = Math.min(Array.isArray(r) ? r[0] : r, w / 2, h / 2); this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r);
+  this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath();
+};
+const $ = s => document.querySelector(s), cv = $('#cv'), YEAR_NOW = new Date().getFullYear();
+const SERIF = 'Georgia,"Iowan Old Style","Times New Roman",serif', SANS = 'system-ui,-apple-system,"Segoe UI",sans-serif';
+const FMT = { story:[1080,1920], feed:[1080,1350], square:[1080,1080] };
+let fmt = 'story', tab = 0, themeSel = 'auto', palOffset = 0, year = YEAR_NOW, data, A = null, tok = 0;
+const by = (s, f, q) => fmt === 'story' ? s : fmt === 'feed' ? f : q;   // pick a value per format
+
+// ---------- Themes: Open Library colour tokens remixed ----------
+// bg1/bg2 gradient · ink text · accent pill/tiles/decor · hi hero number · deco background pattern
+const THEMES = [
+  { name:'Paper Press',   bg1:'hsl(48,31%,84%)',  bg2:'hsl(48,38%,96%)',  ink:'hsl(41,14%,21%)',  accent:'hsl(210,82%,40%)', hi:'hsl(210,84%,31%)', card:'rgba(60,50,30,.09)',  deco:'spines' },
+  { name:'Library Blue',  bg1:'hsl(218,65%,95%)', bg2:'hsl(216,55%,83%)', ink:'hsl(214,79%,19%)', accent:'hsl(210,84%,31%)', hi:'hsl(211,82%,24%)', card:'rgba(20,50,110,.09)', deco:'grid' },
+  { name:'Moss & Cream',  bg1:'hsl(98,30%,95%)',  bg2:'hsl(99,26%,79%)',  ink:'hsl(107,38%,18%)', accent:'hsl(103,32%,30%)', hi:'hsl(105,36%,26%)', card:'rgba(40,70,30,.1)',   deco:'waves' },
+  { name:'Star Gold',     bg1:'hsl(46,80%,95%)',  bg2:'hsl(47,72%,78%)',  ink:'hsl(36,60%,13%)',  accent:'hsl(36,75%,30%)',  hi:'hsl(36,75%,30%)',  card:'rgba(120,70,0,.1)',   deco:'stripes' },
+  { name:'Brick Blush',   bg1:'hsl(14,50%,96%)',  bg2:'hsl(14,45%,84%)',  ink:'hsl(9,60%,17%)',   accent:'hsl(13,55%,40%)',  hi:'hsl(11,58%,35%)',  card:'rgba(120,40,20,.09)', deco:'blobs' },
+  { name:'Author Plum',   bg1:'hsl(288,25%,96%)', bg2:'hsl(288,22%,83%)', ink:'hsl(290,35%,16%)', accent:'hsl(290,30%,30%)', hi:'hsl(290,30%,28%)', card:'rgba(80,30,90,.09)',  deco:'dots' },
+  { name:'Place Teal',    bg1:'hsl(184,30%,95%)', bg2:'hsl(184,27%,79%)', ink:'hsl(186,45%,13%)', accent:'hsl(186,45%,22%)', hi:'hsl(186,45%,20%)', card:'rgba(10,70,80,.09)',  deco:'waves' },
+  { name:'Chart Rose',    bg1:'hsl(348,80%,97%)', bg2:'hsl(348,70%,86%)', ink:'hsl(345,60%,17%)', accent:'hsl(345,62%,40%)', hi:'hsl(345,62%,38%)', card:'rgba(150,30,70,.09)', deco:'sunburst' },
+  { name:'Cream Library', bg1:'hsl(48,38%,98%)',  bg2:'hsl(47,27%,86%)',  ink:'hsl(41,14%,21%)',  accent:'hsl(13,55%,42%)',  hi:'hsl(11,58%,35%)',  card:'rgba(60,50,30,.08)',  deco:'spines' },
+  { name:'Sky & Sand',    bg1:'hsl(48,38%,97%)',  bg2:'hsl(217,63%,88%)', ink:'hsl(41,14%,21%)',  accent:'hsl(36,75%,30%)',  hi:'hsl(36,75%,30%)',  card:'rgba(60,50,30,.08)',  deco:'dots' }
+];
+const LIGHT = THEMES.length;                                            // light themes come first; Auto only picks these
+THEMES.push(
+  { name:'Brand Blue Night', bg1:'hsl(214,79%,16%)', bg2:'hsl(210,82%,40%)', ink:'hsl(48,38%,97%)',  accent:'hsl(42,74%,50%)',  hi:'hsl(47,72%,78%)',  card:'rgba(255,255,255,.12)', deco:'blobs' },
+  { name:'Star Gold Bold',   bg1:'hsl(42,74%,50%)',  bg2:'hsl(36,75%,42%)',  ink:'hsl(41,16%,12%)',  accent:'hsl(41,16%,12%)',  hi:'hsl(41,16%,12%)',  card:'rgba(30,20,0,.12)',     deco:'stripes' },
+  { name:'Chart Pink',       bg1:'hsl(345,62%,36%)', bg2:'hsl(347,80%,50%)', ink:'hsl(0,0%,100%)',   accent:'hsl(45,83%,59%)',  hi:'hsl(45,83%,59%)',  card:'rgba(255,255,255,.14)', deco:'dots' },
+  { name:'Olive Shelf',      bg1:'hsl(107,38%,15%)', bg2:'hsl(103,32%,34%)', ink:'hsl(48,38%,97%)',  accent:'hsl(42,74%,50%)',  hi:'hsl(47,72%,78%)',  card:'rgba(255,255,255,.12)', deco:'spines' },
+  { name:'Brick Red',        bg1:'hsl(9,60%,24%)',   bg2:'hsl(12,80%,45%)',  ink:'hsl(0,0%,100%)',   accent:'hsl(47,72%,78%)',  hi:'hsl(47,72%,78%)',  card:'rgba(255,255,255,.14)', deco:'blobs' },
+  { name:'Plum Night',       bg1:'hsl(290,32%,18%)', bg2:'hsl(288,40%,42%)', ink:'hsl(288,25%,96%)', accent:'hsl(184,60%,70%)', hi:'hsl(184,70%,78%)', card:'rgba(255,255,255,.12)', deco:'stripes' },
+  { name:'Teal Night',       bg1:'hsl(186,50%,12%)', bg2:'hsl(184,50%,30%)', ink:'hsl(184,30%,95%)', accent:'hsl(46,80%,80%)',  hi:'hsl(46,80%,82%)',  card:'rgba(255,255,255,.12)', deco:'dots' },
+  { name:'Midnight Ink',     bg1:'hsl(41,16%,8%)',   bg2:'hsl(214,79%,19%)', ink:'hsl(48,38%,97%)',  accent:'hsl(348,95%,65%)', hi:'hsl(348,95%,76%)', card:'rgba(255,255,255,.1)',  deco:'grid' },
+  { name:'Sunset Shelf',     bg1:'hsl(345,62%,32%)', bg2:'hsl(28,88%,48%)',  ink:'hsl(0,0%,100%)',   accent:'hsl(47,72%,78%)',  hi:'hsl(47,72%,82%)',  card:'rgba(255,255,255,.14)', deco:'sunburst' }
+);
+const opt = (t, i) => `<option value="${i}">${t.name}</option>`;
+$('#theme').innerHTML = '<option value="auto">Auto (light, made for you)</option>'
+  + `<optgroup label="Light · Open Library">${THEMES.slice(0, LIGHT).map(opt).join('')}</optgroup>`
+  + `<optgroup label="Bold · Dark">${THEMES.slice(LIGHT).map((t, i) => opt(t, i + LIGHT)).join('')}</optgroup>`;
+
+// ---------- Mock data (same shape as OL fields) ----------
+function mockData() {
+  const d = (m, x) => `${YEAR_NOW}-${String(m).padStart(2,'0')}-${String(x).padStart(2,'0')}`;
+  // id, title, author, first year, pages, isbn (for the cover), subjects, shelf, date, rating
+  const R = [
+    [1,'The Left Hand of Darkness','Ursula K. Le Guin',1969,304,'9780441478125',['science fiction','fiction'],'Already Read',d(1,9),5],
+    [2,'Piranesi','Susanna Clarke',2020,272,'9781635575637',['fantasy','fiction'],'Already Read',d(2,3),5],
+    [3,'Middlemarch','George Eliot',1871,880,'9780141439549',['english literature','classic'],'Already Read',d(3,20),4],
+    [4,'Braiding Sweetgrass','Robin Wall Kimmerer',2013,391,'9781571313560',['nature','science'],'Already Read',d(4,11),5],
+    [5,'The Hobbit','J.R.R. Tolkien',1937,310,'9780547928227',['fantasy','fiction'],'Already Read',d(5,2),4],
+    [6,'Circe','Madeline Miller',2018,393,'9780316556347',['mythology','fantasy'],'Already Read',d(6,18),4],
+    [7,'Kindred','Octavia E. Butler',1979,null,'9780807083697',['science fiction','historical fiction'],'Already Read',d(7,7),5],
+    [8,'A Wizard of Earthsea','Ursula K. Le Guin',1968,183,'9780547773742',['fantasy','fiction'],'Already Read',d(2,25),5],
+    [9,'The Fellowship of the Ring','J.R.R. Tolkien',1954,432,'9780547928210',['fantasy','fiction'],'Already Read',d(8,12),4],
+    [10,'Pachinko','Min Jin Lee',2017,496,'9781455563937',['historical fiction'],'Currently Reading',d(9,1),0],
+    [11,'A Psalm for the Wild-Built','Becky Chambers',2021,160,'9781250236210',['science fiction'],'Want to Read',d(9,5),0]
+  ];
+  return { viewer:'demo', owner:'demo', goal:12,
+    works:R.map(r => ({ key:'mock:' + r[0], title:r[1], authors:[r[2]], cover_id:null, cover_isbn:r[5], first_publish_year:r[3], pages:r[4], subjects:r[6] })),
+    log:R.map(r => ({ key:'mock:' + r[0], shelf:r[7], date:r[8] })),
+    ratings:R.filter(r => r[9]).map(r => ({ key:'mock:' + r[0], rating:r[9], date:r[8] })) };
+}
+
+// ---------- CSV import (Goodreads / StoryGraph shape) ----------
+function parseCSV(t) {
+  const rows = []; let r = [], f = '', q = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (q) { if (c === '"') { if (t[i+1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { r.push(f); f = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && t[i+1] === '\n') i++; r.push(f); rows.push(r); r = []; f = ''; }
+    else f += c;
+  }
+  if (f || r.length) { r.push(f); rows.push(r); }
+  return rows;
+}
+function fromCSV(text) {
+  const [h, ...rows] = parseCSV(text), H = h.map(x => x.trim().toLowerCase());
+  const g = (r, ...names) => { for (const n of names) { const i = H.indexOf(n); if (i >= 0 && r[i] && r[i].trim()) return r[i].trim(); } return ''; };
+  const out = { viewer:'csv', owner:'csv', goal:null, works:[], log:[], ratings:[] };
+  rows.forEach((r, i) => {
+    const title = g(r, 'title'); if (!title) return;
+    const s = g(r, 'exclusive shelf', 'read status').toLowerCase();
+    const shelf = s === 'read' ? 'Already Read' : s === 'currently-reading' ? 'Currently Reading' : s === 'to-read' ? 'Want to Read' : null;
+    if (!shelf) return;
+    const key = 'csv:' + i, dt = new Date(g(r, 'date read', 'last date read', 'date added'));
+    out.works.push({ key, title:title.replace(/\s*\(.*#.*\)$/, ''), authors:[g(r, 'author', 'authors').split(/,| and /)[0].trim()], cover_id:null,
+      cover_isbn:[g(r, 'isbn13'), g(r, 'isbn')].map(v => v.replace(/\D/g, '')).find(Boolean) || null,
+      first_publish_year:+g(r, 'original publication year', 'year published') || null, pages:+g(r, 'number of pages', 'pages') || null });
+    out.log.push({ key, shelf, date:isNaN(dt) ? `${YEAR_NOW}-01-01` : dt.toISOString().slice(0,10) });
+    const rt = Math.round(parseFloat(g(r, 'my rating', 'star rating')) || 0);
+    if (rt > 0) out.ratings.push({ key, rating:Math.min(5, rt), date:'' });
+  });
+  return out;
+}
+
+// ---------- Genres: OL subjects -> broad genre (first matching rule wins) ----------
+const GENRES = [
+  [/science fiction|sci-fi|dystopi|space opera|cyberpunk/, 'Science Fiction'], [/fantasy|dragon|magic|mytholog|fairy/, 'Fantasy'],
+  [/mystery|detective|crime|thriller|suspense/, 'Mystery & Thriller'], [/horror|ghost|gothic|supernatural/, 'Horror'],
+  [/romance|love stor/, 'Romance'], [/historical fiction|historical|war stor/, 'Historical Fiction'],
+  [/biograph|memoir/, 'Memoir & Biography'], [/nature|science|ecolog|botany|environment|physics|biolog/, 'Science & Nature'],
+  [/history|politic|government|civiliz/, 'History'], [/philosoph|religio|spiritual|psycholog|self-help/, 'Ideas & Mind'],
+  [/poetry|poems/, 'Poetry'], [/young adult|juvenile|children/, 'Young Adult'],
+  [/classic|english literature|american literature|literature/, 'Classics'], [/fiction|novel|stories/, 'Fiction']
+];
+function genreOf(subjects) {
+  if (!subjects || !subjects.length) return null;
+  const s = subjects.join(' | ').toLowerCase();
+  for (const [re, name] of GENRES) if (re.test(s)) return name;
+  return null;
+}
+
+// ---------- Open Library lookups (the only network calls, besides cover images) ----------
+async function lookup(w) {
+  const real = /^\/works\/OL\d+W$/.test(w.key);
+  const qs = real ? `q=key:${w.key}` : `title=${encodeURIComponent(w.title)}&author=${encodeURIComponent((w.authors || [])[0] || '')}`;
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 7000);
+  try {
+    const r = await fetch(`https://openlibrary.org/search.json?${qs}&limit=1&fields=author_key,author_name,subject,cover_i,first_publish_year,number_of_pages_median`, { signal:ctl.signal });
+    if (!r.ok) return false;
+    const d = ((await r.json()).docs || [])[0]; if (!d) return false;
+    const last = s => (s || '').toLowerCase().split(/\s+/).pop();
+    if (d.author_key && d.author_name && (real || last(d.author_name[0]) === last((w.authors || [])[0]))) w.author_key = d.author_key[0];  // guard against wrong-author matches
+    if (d.subject && !(w.subjects && w.subjects.length)) w.subjects = d.subject.slice(0, 40);
+    if (!w.cover_id && !w.cover_isbn && d.cover_i) w.cover_id = d.cover_i;
+    if (!w.pages && d.number_of_pages_median) w.pages = d.number_of_pages_median;
+    if (!w.first_publish_year && d.first_publish_year) w.first_publish_year = d.first_publish_year;
+    return true;
+  } catch (e) { return false; } finally { clearTimeout(t); w._e = 1; }
+}
+async function enrich() {
+  const todo = buildModel().read.slice(0, 16).map(b => data.works.find(w => w.key === b.key)).filter(w => w && !w._e);
+  if (!todo.length) return;
+  say('Fetching author photos and genres from Open Library…'); let ok = 0;
+  for (let i = 0; i < todo.length; i += 4) ok += (await Promise.all(todo.slice(i, i + 4).map(lookup))).filter(Boolean).length;
+  say(ok ? 'Open Library data loaded.' : 'Couldn’t reach Open Library, so the data on hand is used.');
+  refresh();
+}
+
+// ---------- Images (CORS-safe) ----------
+const coverURL = b => b.cover_id ? `https://covers.openlibrary.org/b/id/${b.cover_id}-L.jpg?default=false`
+  : b.cover_isbn ? `https://covers.openlibrary.org/b/isbn/${b.cover_isbn}-L.jpg?default=false` : null;     // default=false: 404 instead of a 1px placeholder
+const authorURL = k => `https://covers.openlibrary.org/a/olid/${k}-L.jpg?default=false`;
+const imgCache = new Map();
+function loadImg(url) {
+  if (!url) return Promise.resolve(null);
+  if (imgCache.has(url)) return imgCache.get(url);
+  const p = new Promise(res => {
+    const im = new Image(); im.crossOrigin = 'anonymous';             // required so toBlob() is allowed
+    const t = setTimeout(() => res(null), 7000);
+    im.onload = () => { clearTimeout(t); res(im.naturalWidth > 1 ? im : null); };
+    im.onerror = () => { clearTimeout(t); res(null); };
+    im.src = url;
+  });
+  imgCache.set(url, p); return p;
+}
+
+// ---------- Model ----------
+const hash = s => [...String(s)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
+function buildModel() {
+  const W = new Map(data.works.map(w => [w.key, w])), R = new Map(data.ratings.map(r => [r.key, r]));
+  const read = [], other = [];
+  for (const e of data.log) {
+    const w = W.get(e.key); if (!w) continue;
+    const b = { ...w, rating:(R.get(e.key) || {}).rating || 0, date:e.date, genre:genreOf(w.subjects) };
+    if (e.shelf === 'Already Read') { if (new Date(e.date).getFullYear() === year) read.push(b); } else other.push(b);
+  }
+  const goalIn = $('#goal').value, goal = goalIn === '' ? null : +goalIn || null;
+  const wp = read.filter(b => b.pages > 0), rated = read.filter(b => b.rating > 0);
+  const top = read.slice().sort((a, b) => b.rating - a.rating || new Date(b.date) - new Date(a.date)).slice(0, 5);
+  const am = new Map(), gm = new Map();
+  for (const b of read) {
+    const name = (b.authors || [])[0];
+    if (name) { const a = am.get(name) || { name, key:null, n:0, rs:0, rc:0 }; a.n++; if (b.author_key && !a.key) a.key = b.author_key; if (b.rating) { a.rs += b.rating; a.rc++; } am.set(name, a); }
+    if (b.genre) gm.set(b.genre, (gm.get(b.genre) || 0) + 1);
+  }
+  const avgOf = a => a.rc ? a.rs / a.rc : 0;
+  return {
+    n:read.length, read, other, top, goal, rated:rated.length, pool:read.length ? top : other.slice(0, 5),
+    authors:[...am.values()].sort((a, b) => b.n - a.n || avgOf(b) - avgOf(a)),
+    genres:[...gm].map(([name, n]) => ({ name, n })).sort((a, b) => b.n - a.n),
+    old:read.filter(b => b.first_publish_year).sort((a, b) => a.first_publish_year - b.first_publish_year)[0],
+    long:wp.slice().sort((a, b) => b.pages - a.pages)[0],
+    pages:wp.reduce((s, b) => s + b.pages, 0), pagesKnown:wp.length,
+    avgPages:wp.length ? wp.reduce((s, b) => s + b.pages, 0) / wp.length : 0,
+    avg:rated.length ? rated.reduce((s, b) => s + b.rating, 0) / rated.length : 0
+  };
+}
+function persona(m) {
+  if (!m.n) return { name:'The Fresh Page', blurb:`Your ${year} story hasn’t started yet. The first chapter is the best one.` };
+  if (m.goal && m.n >= m.goal) return { name:'The Goal Crusher', blurb:`Target set, target smashed. ${m.n} books and counting.` };
+  if (m.avgPages >= 450) return { name:'The Marathoner', blurb:'You go for the doorstoppers and finish them.' };
+  if (m.n >= 24) return { name:'The Page-Turner Machine', blurb:'A book every other week. Do you even sleep?' };
+  if (m.avg >= 4.4 && m.rated >= 3) return { name:'The Eternal Optimist', blurb:'You found a lot to love this year.' };
+  if (m.avg && m.avg <= 3.2 && m.rated >= 3) return { name:'The Tough Critic', blurb:'High standards. Five stars are earned.' };
+  if (m.old && m.old.first_publish_year < 1950) return { name:'The Time Traveler', blurb:`Your shelf reaches all the way back to ${m.old.first_publish_year}.` };
+  if (m.avgPages && m.avgPages <= 250) return { name:'The Sprinter', blurb:'Short, sharp and satisfying reads.' };
+  return { name:'The Steady Reader', blurb:'One chapter at a time. That’s how it’s done.' };
+}
+
+// ---------- Drawing helpers ----------
+function wrap(c, text, maxW, maxLines) {
+  const words = String(text).split(/\s+/), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (c.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  if (lines.length > maxLines) { lines.length = maxLines; let l = lines[maxLines - 1]; while (c.measureText(l + '…').width > maxW && l.length > 1) l = l.slice(0, -1); lines[maxLines - 1] = l + '…'; }
+  return lines;
+}
+const rr = (c, x, y, w, h, r) => { c.beginPath(); c.roundRect(x, y, w, h, r); };
+function fit(c, text, maxW, size, fam, min) { let s = size; c.font = `700 ${s}px ${fam}`; while (c.measureText(text).width > maxW && s > min) { s -= 2; c.font = `700 ${s}px ${fam}`; } return c.font; }
+function decor(c, P, W, H, seed) {                                      // seeded background patterns
+  c.save(); c.fillStyle = c.strokeStyle = P.accent;
+  if (P.deco === 'blobs') for (let i = 0; i < 3; i++) { c.globalAlpha = .2 - i * .04; c.beginPath(); c.arc(((seed >> (i * 3)) % 9) / 8 * W, ((seed >> (i * 4 + 1)) % 9) / 8 * H, 300 + i * 80, 0, 7); c.fill(); }
+  else if (P.deco === 'stripes') { c.globalAlpha = .16; c.translate(W / 2, H / 2); c.rotate(-.5 + (seed % 5) * .05); for (let x = -H; x < H; x += 230) c.fillRect(x, -H, 95, H * 2); }
+  else if (P.deco === 'dots') { c.globalAlpha = .2; const ox = (seed % 2) * W; for (let y = 0; y < H; y += 56) for (let x = 0; x < W + 56; x += 56) { const r = 22 - Math.hypot(x - ox, y) / 60; if (r > 1) { c.beginPath(); c.arc(x, y, r, 0, 7); c.fill(); } } }
+  else if (P.deco === 'grid') { c.globalAlpha = .12; c.lineWidth = 2; for (let x = seed % 60; x < W; x += 60) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke(); } for (let y = 0; y < H; y += 60) { c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke(); } }
+  else if (P.deco === 'sunburst') { c.globalAlpha = .14; c.translate(W / 2, H * .3); const n = 20; for (let k = 0; k < n; k += 2) { c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, H * 1.2, k * 2 * Math.PI / n, (k + 1) * 2 * Math.PI / n); c.closePath(); c.fill(); } }
+  else if (P.deco === 'waves') { c.globalAlpha = .16; c.lineWidth = 26; for (let k = 0; k < 6; k++) { c.beginPath(); for (let x = 0; x <= W; x += 20) { const y = H * (.15 + k * .16) + Math.sin(x / 110 + k + seed % 7) * 40; x ? c.lineTo(x, y) : c.moveTo(x, y); } c.stroke(); } }
+  else for (let x = -(seed % 60), i = 0; x < W; i++) { const w = 50 + ((seed >> i) % 4) * 28; c.globalAlpha = i % 2 ? .06 : .11; c.fillRect(x, 0, w - 8, H); x += w; }   // spines
+  c.restore();
+}
+function placeholder(c, b, x, y, w, h) {                                // plain paper cover, no colour tint
+  c.fillStyle = 'hsl(48,38%,95%)'; c.fillRect(x, y, w, h); c.strokeStyle = 'hsl(45,22%,77%)'; c.lineWidth = 2; c.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  const fs = Math.max(11, Math.round(w * .12)); c.textAlign = 'center'; c.fillStyle = 'hsl(41,14%,21%)'; c.font = `700 ${fs}px ${SERIF}`;
+  wrap(c, b.title, w - 16, 4).forEach((l, i) => c.fillText(l, x + w / 2, y + fs * 2 + i * fs * 1.2));
+}
+function drawCover(c, img, b, x, y, w, h) { c.save(); c.shadowColor = 'rgba(0,0,0,.35)'; c.shadowBlur = 22; c.shadowOffsetY = 9; c.fillStyle = '#fff'; rr(c, x, y, w, h, 6); c.fill(); c.restore();
+  c.save(); rr(c, x, y, w, h, 6); c.clip(); img ? c.drawImage(img, x, y, w, h) : placeholder(c, b, x, y, w, h); c.restore(); }
+function avatar(c, img, a, cx, cy, d, ring) {                                 // round author photo, initials if none
+  c.save(); c.beginPath(); c.arc(cx, cy, d / 2, 0, 7); c.clip();
+  if (img) { const s = Math.max(d / img.naturalWidth, d / img.naturalHeight), w = img.naturalWidth * s, h = img.naturalHeight * s; c.drawImage(img, cx - w / 2, cy - h / 2, w, h); }
+  else { c.fillStyle = 'hsl(48,38%,92%)'; c.fillRect(cx - d / 2, cy - d / 2, d, d); c.fillStyle = 'hsl(41,14%,21%)'; c.font = `700 ${d * .38}px ${SERIF}`; c.textAlign = 'center';
+    c.fillText(a.name.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase(), cx, cy + d * .13); }
+  c.restore(); c.beginPath(); c.arc(cx, cy, d / 2, 0, 7); c.lineWidth = 6; c.strokeStyle = ring; c.stroke();
+}
+
+// ---------- Cards ----------
+function paint(c, W, H, i, A) {
+  const { m, P, per } = A, ink = P.ink;
+  const T = (s, x, y, f, col, al = 'left', a = 1) => { c.font = f; c.fillStyle = col; c.textAlign = al; c.globalAlpha = a; c.fillText(s, x, y); c.globalAlpha = 1; };
+  const sp = v => { if ('letterSpacing' in c) c.letterSpacing = v; };
+  const g = c.createLinearGradient(0, 0, W * .6, H); g.addColorStop(0, P.bg1); g.addColorStop(1, P.bg2); c.fillStyle = g; c.fillRect(0, 0, W, H);
+  decor(c, P, W, H, A.seed + i * 3);
+
+  // shared header: sticker pill, headline (one line on short formats), blurb
+  const head = (pillText, title, blurb) => {
+    const py = by(130, 96, 70); let pf = by(92, 74, 60);
+    sp('5px'); c.font = `700 26px ${SANS}`; const pw = c.measureText(pillText).width + 56;
+    rr(c, 72, py - 38, pw, 58, 29); c.fillStyle = P.accent; c.fill(); T(pillText, 100, py, `700 26px ${SANS}`, P.bg1); sp('0px');
+    c.font = `700 ${pf}px ${SERIF}`; if (fmt !== 'story') while (c.measureText(title).width > 936 && pf > 36) { pf -= 2; c.font = `700 ${pf}px ${SERIF}`; }
+    const y = py + 40 + pf, ls = wrap(c, title, 936, fmt === 'story' ? 2 : 1);
+    ls.forEach((l, k) => T(l, 72, y + k * pf * 1.05, `700 ${pf}px ${SERIF}`, ink));
+    const by2 = y + (ls.length - 1) * pf * 1.05 + 56; c.font = `${by(34, 30, 30)}px ${SANS}`;
+    wrap(c, blurb, 936, by(2, 2, 1)).forEach((l, k) => T(l, 72, by2 + k * 42, c.font, ink, 'left', .88));
+  };
+  const empty = msg => { c.font = `700 44px ${SERIF}`; wrap(c, msg, 800, 3).forEach((l, k) => T(l, W / 2, H / 2 + k * 56, c.font, ink, 'center')); };
+  const ft = by(1830, 1290, 1032);
+  const foot = () => { T('Powered by Open Library', 72, ft, `700 32px ${SERIF}`, ink); T(`#ReadingRecap · ${i + 1}/3`, W - 72, ft, `600 28px ${SANS}`, ink, 'right', .85); };
+
+  if (i === 0) {                                                        // ---- CARD 1: progress
+    head(`READING RECAP · ${year}`, per.name, per.blurb);
+    const big = by(700, 560, 392), bf = by(260, 190, 140);
+    c.save(); c.translate(0, big); c.rotate(-.03);
+    T(String(m.n), 72, 8, `700 ${bf}px ${SERIF}`, ink, 'left', .22); T(String(m.n), 64, 0, `700 ${bf}px ${SERIF}`, P.hi);
+    const nw = c.measureText(String(m.n)).width;
+    T(m.n === 1 ? 'book' : 'books', 96 + nw, -60, `700 52px ${SERIF}`, ink); T(`read in ${year}`, 96 + nw, -14, `32px ${SANS}`, ink, 'left', .9); c.restore();
+
+    const cy = by(900, 650, 492), pool = m.pool, label = m.n ? (m.rated ? 'TOP RATED' : 'RECENT READS') + (m.n < 5 ? ' · JUST GETTING STARTED' : '') : (pool.length ? 'ON YOUR SHELF' : '');
+    sp('4px'); if (label) T(label, 72, cy - 30, `700 24px ${SANS}`, ink, 'left', .85); sp('0px');
+    const gap = 18; let ch = by(300, 255, 255);
+    const rat = pool.map((b, k) => A.covers[k] ? A.covers[k].naturalWidth / A.covers[k].naturalHeight : .66);
+    const tot = () => rat.reduce((s, r) => s + r * ch, 0) + gap * Math.max(0, pool.length - 1);
+    if (tot() > 936) ch *= 936 / tot();
+    let cx = (W - tot()) / 2; pool.forEach((b, k) => { const w = rat[k] * ch; drawCover(c, A.covers[k], b, cx, cy, w, ch); cx += w + gap; });
+
+    const tiles = [];
+    if (m.pagesKnown) tiles.push({ k:'PAGES', v:m.pages.toLocaleString(), s:m.pagesKnown < m.n ? `from ${m.pagesKnown} of ${m.n} books` : `across ${m.n} book${m.n > 1 ? 's' : ''}` });
+    if (m.rated) tiles.push({ k:'AVG RATING', v:m.avg.toFixed(1) + ' ★', s:`from ${m.rated} rating${m.rated > 1 ? 's' : ''}` });
+    if (m.goal) tiles.push({ k:'GOAL', v:`${m.n}/${m.goal}`, s:`${Math.min(100, Math.round(m.n / m.goal * 100))}% of your goal`, bar:Math.min(1, m.n / m.goal) });
+    if (m.long) tiles.push({ k:'LONGEST', v:m.long.pages.toLocaleString() + ' p', s:m.long.title });
+    if (m.old) tiles.push({ k:'OLDEST', v:String(m.old.first_publish_year), s:m.old.title });
+    if (!tiles.length) tiles.push({ k:'SHELVED', v:String(m.other.length), s:'books waiting for you' });
+    const two = fmt === 'story', shown = tiles.slice(0, two ? 4 : 3), cols = two ? 2 : shown.length, tw = (936 - 24 * (cols - 1)) / cols, th = by(230, 250, 190), ty = by(1250, 950, 784);
+    shown.forEach((t, k) => {
+      const x = 72 + (k % cols) * (tw + 24), yy = ty + Math.floor(k / cols) * (th + 24), iw = tw - 56, solid = k % 2 === 0, tc = solid ? P.bg1 : ink;
+      rr(c, x, yy, tw, th, 28); c.fillStyle = solid ? P.accent : P.card; c.fill();
+      sp('3px'); c.font = `700 22px ${SANS}`; T(wrap(c, t.k, iw, 1)[0], x + 28, yy + 46, c.font, tc, 'left', .85); sp('0px');
+      let vf = by(78, 70, 56); c.font = `700 ${vf}px ${SERIF}`; while (c.measureText(t.v).width > iw && vf > 30) { vf -= 2; c.font = `700 ${vf}px ${SERIF}`; }
+      const vb = yy + 56 + vf * .85; T(t.v, x + 28, vb, c.font, tc);
+      c.font = `24px ${SANS}`; wrap(c, t.s, iw, t.bar || th < 200 ? 1 : 2).forEach((l, j) => T(l, x + 28, vb + 36 + j * 30, c.font, tc, 'left', .92));
+      if (t.bar) { const b = yy + th - 30; rr(c, x + 28, b, iw, 14, 7); c.fillStyle = 'rgba(128,128,128,.4)'; c.fill(); rr(c, x + 28, b, Math.max(14, iw * t.bar), 14, 7); c.fillStyle = solid ? P.bg1 : P.hi; c.fill(); }
+    });
+  } else if (i === 1) {                                                 // ---- CARD 2: top authors
+    const au = m.authors, rep = au.length && au[0].n > 1;
+    head(`TOP AUTHORS · ${year}`, rep ? 'Your top authors' : 'Authors you loved', au.length ? `${au.length} author${au.length > 1 ? 's' : ''} across ${m.n} book${m.n > 1 ? 's' : ''}.` : 'Finish a book to meet them.');
+    if (!au.length) { empty('Finish a book and its author shows up here.'); foot(); return; }
+    const meta = a => `${a.n} book${a.n > 1 ? 's' : ''}` + (a.rc ? ` · ${(a.rs / a.rc).toFixed(1)} ★` : '');
+    const hero = fmt !== 'square' ? au[0] : null, off = hero ? 1 : 0;
+    if (hero) {
+      const cy = by(650, 520, 0), d = by(340, 270, 0), ny = cy + d / 2 + by(70, 60, 0);
+      avatar(c, A.aImgs[0], hero, W / 2, cy, d, P.accent); T(hero.name, W / 2, ny, fit(c, hero.name, 936, by(64, 54, 0), SERIF, 34), ink, 'center');
+      T(meta(hero), W / 2, ny + 44, `30px ${SANS}`, ink, 'center', .9);
+    }
+    const y0 = by(1010, 810, 270), rh = by(230, 200, 210), bh = by(200, 176, 190), d = by(150, 130, 150);
+    au.slice(off, off + by(3, 2, 3)).forEach((a, j) => {
+      const yy = y0 + j * rh, solid = j % 2 === 0, tc = solid ? P.bg1 : ink, tx = 72 + 28 + d + 28, avail = 1008 - 28 - 110 - tx;
+      rr(c, 72, yy, 936, bh, 28); c.fillStyle = solid ? P.accent : P.card; c.fill();
+      avatar(c, A.aImgs[j + off], a, 72 + 28 + d / 2, yy + bh / 2, d, solid ? P.bg1 : P.accent);
+      T(`#${j + off + 1}`, 1008 - 28, yy + bh / 2 + 20, `700 60px ${SERIF}`, tc, 'right', .9);
+      T(a.name, tx, yy + bh / 2 - 6, fit(c, a.name, avail, by(46, 42, 42), SERIF, 26), tc);
+      T(meta(a), tx, yy + bh / 2 + 36, `26px ${SANS}`, tc, 'left', .92);
+    });
+  } else {                                                              // ---- CARD 3: books + genres
+    const gs = m.genres.slice(0, by(4, 3, 0)), tops = m.top.slice(0, by(5, 4, 4));
+    head(`GENRES · ${year}`, 'Your genre mix', m.genres.length ? `Most read: ${m.genres[0].name}` : 'Genres load from Open Library when you’re online.');
+    if (!m.n) { empty('Finish a book and its genre shows up here.'); foot(); return; }
+    if (gs.length) {
+      const y = by(430, 330, 0), bx = 380, bw = 1008 - bx, bhh = 44, step = by(92, 84, 0), mx = gs[0].n;
+      gs.forEach((q, k) => {
+        const yy = y + k * step; T(q.name, 72, yy + 31, fit(c, q.name, 296, 30, SANS, 20), ink);
+        rr(c, bx, yy, bw, bhh, 22); c.fillStyle = P.card; c.fill();
+        const w = Math.max(bhh + 10, bw * q.n / mx); rr(c, bx, yy, w, bhh, 22); c.fillStyle = P.accent; c.fill();
+        T(String(q.n), bx + w - 18, yy + 31, `700 28px ${SANS}`, P.bg1, 'right');
+      });
+    }
+    const y0 = by(860, 650, 270), rh = by(180, 150, 170), bh = rh - 18, px = 16;
+    tops.forEach((b, k) => {
+      const yy = y0 + k * rh, img = A.covers[k], chh = bh - 24, w = Math.round(chh * (img ? img.naturalWidth / img.naturalHeight : .66));
+      rr(c, 72, yy, 936, bh, 22); c.fillStyle = P.card; c.fill();
+      drawCover(c, img, b, 72 + px, yy + 12, w, chh);
+      const tx = 72 + px + w + 24, avail = 1008 - 20 - tx;
+      c.font = `700 ${by(36, 32, 36)}px ${SERIF}`; T(wrap(c, b.title, avail, 1)[0], tx, yy + by(50, 40, 50), c.font, ink);
+      c.font = `${by(26, 24, 26)}px ${SANS}`; T(wrap(c, (b.authors || [])[0] || '', avail, 1)[0], tx, yy + by(86, 70, 86), c.font, ink, 'left', .85);
+      if (b.genre) { c.font = `700 22px ${SANS}`; const pw = c.measureText(b.genre).width + 36, ph = by(40, 36, 40), py = yy + by(86, 70, 86) + 14;
+        rr(c, tx, py, pw, ph, ph / 2); c.fillStyle = P.accent; c.fill(); T(b.genre, tx + 18, py + ph / 2 + 8, c.font, P.bg1); }
+    });
+  }
+  foot();
+}
+
+// ---------- Pipeline ----------
+const pickTheme = A0 => themeSel === 'auto' ? THEMES[(A0.seed + palOffset) % LIGHT] : THEMES[+themeSel];
+async function prep(noRemote) {
+  const m = buildModel(), ld = u => noRemote ? null : loadImg(u);
+  const [covers, aImgs] = await Promise.all([Promise.all(m.pool.map(b => ld(coverURL(b)))), Promise.all(m.authors.slice(0, 4).map(a => ld(a.key && authorURL(a.key))))]);
+  return { m, covers, aImgs, per:persona(m), seed:hash(m.n + (m.top[0] ? m.top[0].title : 'x')) };
+}
+function paintTo(canvas, i) { const [W, H] = FMT[fmt]; canvas.width = W; canvas.height = H; A.P = pickTheme(A); paint(canvas.getContext('2d'), W, H, i, A); }
+function setAlt() {
+  const m = A.m, s = n => n === 1 ? '' : 's';
+  const t = [`Card 1 of 3, progress: ${A.per.name}. ${m.n} book${s(m.n)} read in ${year}` + (m.pagesKnown ? `, ${m.pages} pages` : '') + (m.rated ? `, average rating ${m.avg.toFixed(1)} of 5` : '') + (m.goal ? `, goal ${m.n} of ${m.goal}` : '') + '.',
+    `Card 2 of 3, top authors: ${m.authors.slice(0, 4).map(a => `${a.name} (${a.n})`).join(', ') || 'none yet'}.`,
+    `Card 3 of 3, genres: ${m.genres.slice(0, 4).map(g => `${g.name} (${g.n})`).join(', ') || 'not available'}. Books: ${m.top.map(b => b.title + (b.genre ? ', ' + b.genre : '')).join('; ') || 'none'}.`][tab];
+  cv.setAttribute('aria-label', t); $('#alt').textContent = t;
+}
+async function refresh(noRemote) {
+  const my = ++tok, a = await prep(noRemote); if (my !== tok) return; A = a; paintTo(cv, tab); setAlt();
+}
+const repaint = () => { if (A) { paintTo(cv, tab); setAlt(); } };
+
+// ---------- Export / share ----------
+const say = t => $('#status').textContent = t;
+const toBlob = canvas => new Promise(res => { try { canvas.toBlob(res, 'image/png'); } catch (e) { res(null); } });
+async function blobFor(i) {
+  let cn = document.createElement('canvas'); paintTo(cn, i); let b = await toBlob(cn);
+  if (!b) { say('A remote image blocked export, so placeholders are used instead.'); await refresh(true); cn = document.createElement('canvas'); paintTo(cn, i); b = await toBlob(cn); }
+  return b;
+}
+const fname = i => `reading-recap-${year}-${i + 1}-${['progress', 'authors', 'genres'][i]}-${fmt}.png`;
+function save(b, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); }
+$('#dl').onclick = async () => { const b = await blobFor(tab); if (b) { save(b, fname(tab)); say('Saved this card as a full-size PNG.'); } };
+async function all() { const f = []; for (let i = 0; i < 3; i++) { const b = await blobFor(i); if (!b) return null; f.push(new File([b], fname(i), { type:'image/png' })); } return f; }
+$('#dlall').onclick = async () => { const f = await all(); if (!f) return; f.forEach((x, i) => setTimeout(() => save(x, x.name), i * 400)); say('Saving all 3 cards. Allow multiple downloads if asked.'); };
+$('#share').onclick = async () => {
+  const f = await all(); if (!f) return;
+  if (navigator.canShare && navigator.canShare({ files:f })) { try { await navigator.share({ files:f, title:'My Reading Recap', text:'My year in books, from Open Library' }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  f.forEach((x, i) => setTimeout(() => save(x, x.name), i * 400)); say('Sharing isn’t available here, so the 3 cards were downloaded.');   // fallback
+};
+$('#copy').onclick = async () => { try { await navigator.clipboard.writeText(/^https?:/.test(location.protocol) ? location.origin + location.pathname : 'https://openlibrary.org/'); say('Link copied.'); } catch (e) { say('Copy failed. Use the address bar instead.'); } };
+
+// ---------- Controls ----------
+function group(sel, attr, fn) { document.querySelectorAll(sel + ' button').forEach(btn => btn.onclick = () => { document.querySelectorAll(sel + ' button').forEach(x => x.setAttribute('aria-pressed', x === btn)); fn(btn.dataset[attr]); }); }
+group('#fmts', 'f', v => { fmt = v; repaint(); });
+group('#tabs', 'c', v => { tab = +v; repaint(); });
+$('#theme').onchange = e => { themeSel = e.target.value; repaint(); };
+$('#surprise').onclick = () => { themeSel = String(Math.floor(Math.random() * THEMES.length)); $('#theme').value = themeSel; repaint(); };   // any theme, light or bold
+$('#goal').oninput = () => refresh();
+$('#yr').onchange = e => { year = +e.target.value; refresh(); enrich(); };
+$('#csv').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { data = fromCSV(await f.text()); setup(); say(`Imported ${data.log.length} books. Nothing was uploaded.`); } catch (err) { say('Couldn’t read that CSV.'); }
+  e.target.value = '';
+};
+function setup() {
+  const ys = [...new Set(data.log.filter(e => e.shelf === 'Already Read').map(e => new Date(e.date).getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+  if (!ys.includes(YEAR_NOW)) ys.unshift(YEAR_NOW);
+  $('#yr').innerHTML = ys.map(y => `<option>${y}</option>`).join(''); year = ys.includes(year) ? year : ys[0]; $('#yr').value = year;
+  $('#goal').value = data.goal || '';
+  if (data.blocked) say('This reading log is private. Only your own recap can be shown.');
+  refresh().then(enrich);
+}
+
+// Privacy guard: only ever render the viewer's own data.
+data = mockData();
+if (window.OL_RECAP_DATA) { const h = window.OL_RECAP_DATA; data = (h.viewer && h.owner && h.viewer !== h.owner) ? { works:[], log:[], ratings:[], goal:null, blocked:true } : h; }
+setup();
+})();
+</script>
+</body>
+</html>
